@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Air Drawing Recognition</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+            background-color: #0d1117;
+            color: #c9d1d9;
+            line-height: 1.6;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 2rem;
+        }
+        h1 { color: #58a6ff; border-bottom: 1px solid #30363d; padding-bottom: 0.3em; }
+        h2 { color: #8b949e; margin-top: 1.5em; }
+        code { background-color: #161b22; padding: 0.2em 0.4em; border-radius: 6px; font-family: monospace; }
+        pre { background-color: #161b22; padding: 1rem; border-radius: 6px; overflow-x: auto; }
+        ul { list-style-type: none; padding-left: 0; }
+        li { background: #21262d; margin: 8px 0; padding: 10px 15px; border-radius: 6px; }
+        .gesture { font-weight: bold; color: #7ee787; }
+    </style>
+</head>
+<body>
+
+    <h1>✨ Air-Drawing Recognition</h1>
+    <p>A computer vision application that lets you trace shapes mid-air and manipulate canvas elements using hand gestures in real-time!</p>
+
+    <h2>🖐️ Supported Gestures</h2>
+    <ul>
+        <li><span class="gesture">👆 Point (Index Finger)</span> — Draw / trace shapes in mid-air</li>
+        <li><span class="gesture">✌️ Peace Sign</span> — Toggle Move Mode (Pan & Zoom using both hands)</li>
+        <li><span class="gesture">🖖 Three Fingers Up</span> — Undo last shape</li>
+        <li><span class="gesture">✋ Open Palm</span> — Redo last shape</li>
+        <li><span class="gesture">👌 OK Sign</span> — Clear canvas</li>
+        <li><span class="gesture">👍 Thumbs Up</span> — Cycle drawing color</li>
+    </ul>
+
+    <h2>🚀 How to Run Locally</h2>
+    <p>Clone the repository and install dependencies:</p>
+    <pre><code>pip install opencv-python mediapipe numpy
+python draw.py</code></pre>
+
+</body>
+</html>
