@@ -28,13 +28,21 @@
       box-shadow: 0 10px 30px rgba(0,0,0,0.5);
       border: 2px solid #30363d;
     }
-    video, canvas {
+    video {
       position: absolute;
       top: 0;
       left: 0;
       width: 100%;
       height: 100%;
       transform: scaleX(-1); 
+    }
+    canvas {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+
     }
     #overlay-ui {
       position: absolute;
@@ -162,7 +170,7 @@
     }
 
     function fingersUp(lm) {
-      const thumb = lm[4].x < lm[3].x; 
+      const thumb = lm[4].x < lm[3].x;
       const index = lm[8].y < lm[6].y - 0.02;
       const middle = lm[12].y < lm[10].y - 0.02;
       const ring = lm[16].y < lm[14].y - 0.02;
@@ -185,7 +193,7 @@
 
 
     function recognizeShape(points) {
-      if (points.length < 10) return { label: "freehand", score: 0 };
+      if (points.length < 10) return { label: "freehand", shapePts: points };
       
       const xs = points.map(p => p.x);
       const ys = points.map(p => p.y);
@@ -198,7 +206,7 @@
       const aspectRatio = Math.min(w, h) / Math.max(w, h);
       const firstLastDist = Math.hypot(points[0].x - points[points.length-1].x, points[0].y - points[points.length-1].y);
 
-      // Simple heuristic shape matching
+
       if (firstLastDist < r * 0.8) {
         if (aspectRatio > 0.65) {
           return { label: "circle", shapePts: generateCircle(cx, cy, r) };
@@ -225,7 +233,7 @@
       return pts;
     }
 
-    // --- Main Loop ---
+
     function onResults(results) {
       canvasCtx.save();
       canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
@@ -240,7 +248,7 @@
           presentGestures.add(gesture);
           
           const indexTip = {
-            x: (1 - lm[8].x) * canvasElement.width,
+            x: (1 - lm[8].x) * canvasElement.width, 
             y: lm[8].y * canvasElement.height
           };
           handsInfo.push({ lm, gesture, indexTip });
@@ -321,14 +329,12 @@
         }
       }
 
-
       strokes.forEach(s => {
         if (s.points.length === 0) return;
         canvasCtx.beginPath();
         canvasCtx.strokeStyle = s.color;
         canvasCtx.lineWidth = 4;
 
-        // Apply Transformation
         const pts = s.points;
         const cx = pts.reduce((sum, p) => sum + p.x, 0) / pts.length;
         const cy = pts.reduce((sum, p) => sum + p.y, 0) / pts.length;
@@ -344,7 +350,7 @@
         canvasCtx.stroke();
       });
 
-      // Render active drawing line
+
       if (activePoints.length > 1) {
         canvasCtx.beginPath();
         canvasCtx.strokeStyle = DRAW_COLORS[colorIndex];
