@@ -34,7 +34,7 @@
       left: 0;
       width: 100%;
       height: 100%;
-      transform: scaleX(-1); 
+      transform: scaleX(-1);
     }
     canvas {
       position: absolute;
@@ -42,7 +42,6 @@
       left: 0;
       width: 100%;
       height: 100%;
-
     }
     #overlay-ui {
       position: absolute;
@@ -55,6 +54,11 @@
       display: flex;
       flex-direction: column;
       justify-content: space-between;
+    }
+    .badge-row {
+      display: flex;
+      align-items: center;
+      gap: 12px;
     }
     .badge {
       background: rgba(13, 17, 23, 0.85);
@@ -75,18 +79,28 @@
       border-radius: 4px;
       border: 2px solid #fff;
     }
+    #badge-3d {
+      background: rgba(13, 17, 23, 0.85);
+      backdrop-filter: blur(8px);
+      padding: 10px 16px;
+      border-radius: 8px;
+      border: 1px solid #ffb43c;
+      color: #ffb43c;
+      font-weight: bold;
+      font-size: 1.1rem;
+      display: none;
+    }
     .controls-hint {
       background: rgba(13, 17, 23, 0.85);
       backdrop-filter: blur(8px);
       padding: 12px;
       border-radius: 8px;
       border: 1px solid #30363d;
-      font-size: 0.9rem;
+      font-size: 0.85rem;
       color: #8b949e;
       text-align: center;
     }
   </style>
-
 
   <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
   <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
@@ -96,303 +110,27 @@
   <div id="container">
     <video id="webcam" playsinline></video>
     <canvas id="output_canvas" width="1280" height="720"></canvas>
-    
+
     <div id="overlay-ui">
-      <div class="badge">
-        <span id="mode-text" style="color: #38ef7d;">MODE: DRAW</span>
-        <div id="color-box" class="color-preview" style="background: rgb(60, 220, 255);"></div>
+      <div class="badge-row">
+        <div class="badge">
+          <span id="mode-text" style="color: #38ef7d;">MODE: DRAW</span>
+          <div id="color-box" class="color-preview" style="background: rgb(60, 220, 255);"></div>
+        </div>
+        <div id="badge-3d">3D</div>
       </div>
       <div class="controls-hint">
-        👆 Point = Draw | ✌️ Peace = Move | 🖖 3 Fingers = Undo | ✋ Palm = Redo | 👌 OK = Clear | 👍 Thumb = Color
+        👆 Point = Draw &nbsp;|&nbsp; ✌️ Peace = Move &nbsp;|&nbsp; 🖖 3 Fingers = Undo &nbsp;|&nbsp;
+        ✋ Palm = Redo &nbsp;|&nbsp; 👌 OK = Clear &nbsp;|&nbsp; 👍 Thumb = Color &nbsp;|&nbsp;
+        🤘 Rock On = Toggle 3D
       </div>
     </div>
   </div>
 
-  <script>
-    const videoElement = document.getElementById('webcam');
-    const canvasElement = document.getElementById('output_canvas');
-    const canvasCtx = canvasElement.getContext('2d');
-    const modeText = document.getElementById('mode-text');
-    const colorBox = document.getElementById('color-box');
 
-    const DRAW_COLORS = [
-      'rgb(60, 220, 255)',
-      'rgb(255, 120, 60)',
-      'rgb(120, 60, 255)',
-      'rgb(80, 255, 120)',
-      'rgb(255, 255, 255)'
-    ];
-
-    let colorIndex = 0;
-    let mode = "draw";
-    let strokes = [];
-    let undoneStrokes = [];
-    let activePoints = [];
-    let wasDrawing = false;
-    let moveAnchor = null;
-    let moveReference = [];
-
-
-    class GestureTrigger {
-      constructor(name, holdFrames = 5, cooldownMs = 600) {
-        this.name = name;
-        this.holdFrames = holdFrames;
-        this.cooldownMs = cooldownMs;
-        this.count = 0;
-        this.lastFired = 0;
-      }
-      update(presentGestures) {
-        if (presentGestures.has(this.name)) {
-          this.count++;
-        } else {
-          this.count = 0;
-        }
-        const now = Date.now();
-        if (this.count === this.holdFrames && (now - this.lastFired > this.cooldownMs)) {
-          this.lastFired = now;
-          return true;
-        }
-        return false;
-      }
-    }
-
-    const triggers = {
-      peace: new GestureTrigger("peace"),
-      undo: new GestureTrigger("three_up"),
-      redo: new GestureTrigger("open_palm"),
-      clear: new GestureTrigger("ok_sign"),
-      color: new GestureTrigger("thumbs_up")
-    };
-
-
-    function dist(a, b) {
-      return Math.hypot(a.x - b.x, a.y - b.y);
-    }
-
-    function fingersUp(lm) {
-      const thumb = lm[4].x < lm[3].x;
-      const index = lm[8].y < lm[6].y - 0.02;
-      const middle = lm[12].y < lm[10].y - 0.02;
-      const ring = lm[16].y < lm[14].y - 0.02;
-      const pinky = lm[20].y < lm[18].y - 0.02;
-      return { thumb, index, middle, ring, pinky };
-    }
-
-    function classifyGesture(lm) {
-      const { thumb, index, middle, ring, pinky } = fingersUp(lm);
-      const isPinch = dist(lm[4], lm[8]) < 0.055;
-
-      if (middle && ring && pinky && isPinch) return "ok_sign";
-      if (index && !middle && !ring && !pinky) return "draw";
-      if (index && middle && !ring && !pinky) return "peace";
-      if (index && middle && ring && !pinky) return "three_up";
-      if (index && middle && ring && pinky) return "open_palm";
-      if (thumb && !index && !middle && !ring && !pinky) return "thumbs_up";
-      return "unknown";
-    }
-
-
-    function recognizeShape(points) {
-      if (points.length < 10) return { label: "freehand", shapePts: points };
-      
-      const xs = points.map(p => p.x);
-      const ys = points.map(p => p.y);
-      const minX = Math.min(...xs), maxX = Math.max(...xs);
-      const minY = Math.min(...ys), maxY = Math.max(...ys);
-      const w = maxX - minX, h = maxY - minY;
-      const cx = (minX + maxX) / 2, cy = (minY + maxY) / 2;
-      const r = Math.max(w, h) / 2;
-
-      const aspectRatio = Math.min(w, h) / Math.max(w, h);
-      const firstLastDist = Math.hypot(points[0].x - points[points.length-1].x, points[0].y - points[points.length-1].y);
-
-
-      if (firstLastDist < r * 0.8) {
-        if (aspectRatio > 0.65) {
-          return { label: "circle", shapePts: generateCircle(cx, cy, r) };
-        } else {
-          return { label: "square", shapePts: generateSquare(cx, cy, r) };
-        }
-      }
-      return { label: "freehand", shapePts: points };
-    }
-
-    function generateSquare(cx, cy, r) {
-      return [
-        {x: cx - r, y: cy - r}, {x: cx + r, y: cy - r},
-        {x: cx + r, y: cy + r}, {x: cx - r, y: cy + r}, {x: cx - r, y: cy - r}
-      ];
-    }
-
-    function generateCircle(cx, cy, r) {
-      const pts = [];
-      for (let i = 0; i <= 40; i++) {
-        const a = (i / 40) * Math.PI * 2;
-        pts.push({ x: cx + r * Math.cos(a), y: cy + r * Math.sin(a) });
-      }
-      return pts;
-    }
-
-
-    function onResults(results) {
-      canvasCtx.save();
-      canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
-
-      const presentGestures = new Set();
-      const handsInfo = [];
-
-      if (results.multiHandLandmarks) {
-        for (let i = 0; i < results.multiHandLandmarks.length; i++) {
-          const lm = results.multiHandLandmarks[i];
-          const gesture = classifyGesture(lm);
-          presentGestures.add(gesture);
-          
-          const indexTip = {
-            x: (1 - lm[8].x) * canvasElement.width, 
-            y: lm[8].y * canvasElement.height
-          };
-          handsInfo.push({ lm, gesture, indexTip });
-        }
-      }
-
-
-      if (triggers.peace.update(presentGestures)) {
-        mode = mode === "draw" ? "move" : "draw";
-        moveAnchor = null;
-        activePoints = [];
-      }
-      if (triggers.undo.update(presentGestures) && strokes.length > 0) {
-        undoneStrokes.push(strokes.pop());
-      }
-      if (triggers.redo.update(presentGestures) && undoneStrokes.length > 0) {
-        strokes.push(undoneStrokes.pop());
-      }
-      if (triggers.clear.update(presentGestures)) {
-        strokes = [];
-        undoneStrokes = [];
-        activePoints = [];
-      }
-      if (triggers.color.update(presentGestures)) {
-        colorIndex = (colorIndex + 1) % DRAW_COLORS.length;
-      }
-
-
-      modeText.innerText = `MODE: ${mode.toUpperCase()}`;
-      modeText.style.color = mode === "draw" ? "#38ef7d" : "#ffb43c";
-      colorBox.style.background = DRAW_COLORS[colorIndex];
-
-
-      if (mode === "draw") {
-        const drawHand = handsInfo.find(h => h.gesture === "draw");
-        if (drawHand) {
-          activePoints.push(drawHand.indexTip);
-          wasDrawing = true;
-        } else {
-          if (wasDrawing && activePoints.length >= 8) {
-            const shape = recognizeShape(activePoints);
-            strokes.push({
-              points: shape.shapePts,
-              color: DRAW_COLORS[colorIndex],
-              isClosed: shape.label !== "freehand",
-              offset: { x: 0, y: 0 },
-              scale: 1.0
-            });
-            undoneStrokes = [];
-          }
-          activePoints = [];
-          wasDrawing = false;
-        }
-      } else {
-
-        if (handsInfo.length === 2) {
-          const p1 = handsInfo[0].indexTip;
-          const p2 = handsInfo[1].indexTip;
-          const mid = { x: (p1.x + p2.x) / 2, y: (p1.y + p2.y) / 2 };
-          const distVal = Math.hypot(p1.x - p2.x, p1.y - p2.y);
-
-          if (!moveAnchor) {
-            moveAnchor = { mid, distVal };
-            moveReference = strokes.map(s => ({ offset: { ...s.offset }, scale: s.scale }));
-          } else {
-            const pan = { x: mid.x - moveAnchor.mid.x, y: mid.y - moveAnchor.mid.y };
-            const zoom = distVal / moveAnchor.distVal;
-            strokes.forEach((s, idx) => {
-              if (moveReference[idx]) {
-                s.offset.x = moveReference[idx].offset.x + pan.x;
-                s.offset.y = moveReference[idx].offset.y + pan.y;
-                s.scale = Math.max(0.2, Math.min(4.0, moveReference[idx].scale * zoom));
-              }
-            });
-          }
-        } else {
-          moveAnchor = null;
-        }
-      }
-
-      strokes.forEach(s => {
-        if (s.points.length === 0) return;
-        canvasCtx.beginPath();
-        canvasCtx.strokeStyle = s.color;
-        canvasCtx.lineWidth = 4;
-
-        const pts = s.points;
-        const cx = pts.reduce((sum, p) => sum + p.x, 0) / pts.length;
-        const cy = pts.reduce((sum, p) => sum + p.y, 0) / pts.length;
-
-        pts.forEach((p, i) => {
-          const tx = (p.x - cx) * s.scale + cx + s.offset.x;
-          const ty = (p.y - cy) * s.scale + cy + s.offset.y;
-          if (i === 0) canvasCtx.moveTo(tx, ty);
-          else canvasCtx.lineTo(tx, ty);
-        });
-
-        if (s.isClosed) canvasCtx.closePath();
-        canvasCtx.stroke();
-      });
-
-
-      if (activePoints.length > 1) {
-        canvasCtx.beginPath();
-        canvasCtx.strokeStyle = DRAW_COLORS[colorIndex];
-        canvasCtx.lineWidth = 4;
-        activePoints.forEach((p, i) => {
-          if (i === 0) canvasCtx.moveTo(p.x, p.y);
-          else canvasCtx.lineTo(p.x, p.y);
-        });
-        canvasCtx.stroke();
-      }
-
-
-      handsInfo.forEach(h => {
-        canvasCtx.beginPath();
-        canvasCtx.arc(h.indexTip.x, h.indexTip.y, 8, 0, 2 * Math.PI);
-        canvasCtx.fillStyle = "#ffffff";
-        canvasCtx.fill();
-      });
-
-      canvasCtx.restore();
-    }
-
-
-    const hands = new Hands({
-      locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
-    });
-    hands.setOptions({
-      maxNumHands: 2,
-      modelComplexity: 1,
-      minDetectionConfidence: 0.7,
-      minTrackingConfidence: 0.6
-    });
-    hands.onResults(onResults);
-
-    const camera = new Camera(videoElement, {
-      onFrame: async () => {
-        await hands.send({ image: videoElement });
-      },
-      width: 1280,
-      height: 720
-    });
-    camera.start();
-  </script>
+  <script src="gesture.js"></script>
+  <script src="recognizer.js"></script>
+  <script src="shape3d.js"></script>
+  <script src="draw.js"></script>
 </body>
 </html>
