@@ -127,10 +127,813 @@
     </div>
   </div>
 
+  <!--
+    All app logic is inlined below (instead of separate <script src="...">
+    files) so nothing can 404 due to a missing file, a path typo, or a
+    case-mismatch on a case-sensitive host. Order matters: gesture ->
+    recognizer -> shape3d define globals that the final draw script relies on.
+  -->
+  <script>
+  // ============================== gesture.js ==============================
+/**
+ * gesture.js
+ *
+ * Classifies hand poses from MediaPipe Hands landmarks into named
+ * gestures, mirroring the logic in the Python gesture_utils.py.
+ *
+ * IMPORTANT: this assumes the image fed into MediaPipe has already
+ * been mirrored (see draw.js, which draws the camera feed onto a
+ * flipped offscreen canvas before calling hands.send). With a
+ * mirrored input, MediaPipe's handedness label directly matches the
+ * hand the user intuitively expects ("Right" = their right hand),
+ * exactly like Python's `cv2.flip(frame, 1)` before processing.
+ * If you ever feed MediaPipe an unflipped frame, you must swap the
+ * handedness label AND flip the thumb-direction test below, or the
+ * thumb-based gestures (thumbs_up) will only work for one hand.
+ *
+ * MediaPipe hand landmark indices (for reference):
+ *   0: WRIST
+ *   1-4:   THUMB (CMC, MCP, IP, TIP)
+ *   5-8:   INDEX (MCP, PIP, DIP, TIP)
+ *   9-12:  MIDDLE (MCP, PIP, DIP, TIP)
+ *   13-16: RING (MCP, PIP, DIP, TIP)
+ *   17-20: PINKY (MCP, PIP, DIP, TIP)
+ */
 
-  <script src="gesture.js"></script>
-  <script src="recognizer.js"></script>
-  <script src="shape3d.js"></script>
-  <script src="draw.js"></script>
+const THUMB_TIP = 4, THUMB_IP = 3;
+const INDEX_TIP = 8, INDEX_PIP = 6;
+const MIDDLE_TIP = 12, MIDDLE_PIP = 10;
+const RING_TIP = 16, RING_PIP = 14;
+const PINKY_TIP = 20, PINKY_PIP = 18;
+
+function dist(a, b) {
+  return Math.hypot(a.x - b.x, a.y - b.y);
+}
+
+/**
+ * Returns { thumb, index, middle, ring, pinky } booleans for whether
+ * each finger is extended.
+ *
+ * handedness: "Left" or "Right", as reported by MediaPipe on a
+ * mirrored input frame (see module docstring above).
+ */
+function fingersUp(lm, handedness = "Right") {
+  const thumb =
+    handedness === "Right"
+      ? lm[THUMB_TIP].x < lm[THUMB_IP].x
+      : lm[THUMB_TIP].x > lm[THUMB_IP].x;
+
+  const index = lm[INDEX_TIP].y < lm[INDEX_PIP].y - 0.02;
+  const middle = lm[MIDDLE_TIP].y < lm[MIDDLE_PIP].y - 0.02;
+  const ring = lm[RING_TIP].y < lm[RING_PIP].y - 0.02;
+  const pinky = lm[PINKY_TIP].y < lm[PINKY_PIP].y - 0.02;
+
+  return { thumb, index, middle, ring, pinky };
+}
+
+function thumbIndexPinch(lm, threshold = 0.055) {
+  return dist(lm[THUMB_TIP], lm[INDEX_TIP]) < threshold;
+}
+
+/**
+ * Classifies a single hand's pose into one of a small set of named
+ * gestures. Returns one of:
+ *   "draw", "peace", "three_up", "open_palm", "ok_sign",
+ *   "thumbs_up", "rock_on", "fist", "unknown"
+ */
+function classifyGesture(lm, handedness = "Right") {
+  const { thumb, index, middle, ring, pinky } = fingersUp(lm, handedness);
+
+
+  if (middle && ring && pinky && thumbIndexPinch(lm)) return "ok_sign";
+
+  if (index && !middle && !ring && !pinky) return "draw";
+  if (index && middle && !ring && !pinky) return "peace";
+  if (index && middle && ring && !pinky) return "three_up";
+  if (index && middle && ring && pinky) return "open_palm";
+  if (thumb && !index && !middle && !ring && !pinky) return "thumbs_up";
+  if (index && pinky && !middle && !ring) return "rock_on";
+  if (!thumb && !index && !middle && !ring && !pinky) return "fist";
+
+  return "unknown";
+}
+
+/** Pixel-space (x, y) of a given landmark index. */
+function landmarkPos(lm, frameW, frameH, index = INDEX_TIP) {
+  return { x: lm[index].x * frameW, y: lm[index].y * frameH };
+}
+
+  </script>
+
+  <script>
+
+/**
+ * recognizer.js
+ *
+ * JS port of the Python shape_recognizer.py: a simplified $1
+ * Unistroke Recognizer (Wobbrock, Wilson & Li, 2007) that classifies
+ * a traced (x, y) point path into square / circle / triangle / line.
+ *
+ * No dependencies, just math -- resample to a fixed point count,
+ * normalize rotation/scale/position, then brute-force sweep a small
+ * rotation range to find the best match against each template.
+ */
+
+const NUM_RESAMPLE_POINTS = 64;
+const SQUARE_SIZE = 250.0;
+const ANGLE_SWEEP_RANGE = (45 * Math.PI) / 180;
+const ANGLE_SWEEP_STEP = (2 * Math.PI) / 180;
+
+function pathLength(points) {
+  let total = 0;
+  for (let i = 1; i < points.length; i++) {
+    total += Math.hypot(points[i].x - points[i - 1].x, points[i].y - points[i - 1].y);
+  }
+  return total;
+}
+
+function resample(points, n = NUM_RESAMPLE_POINTS) {
+  const interval = pathLength(points) / (n - 1);
+  if (interval === 0) return new Array(n).fill(points[0]);
+
+  const newPoints = [points[0]];
+  let accumulated = 0.0;
+  const pts = points.slice();
+
+  let i = 1;
+  while (i < pts.length) {
+    const d = Math.hypot(pts[i].x - pts[i - 1].x, pts[i].y - pts[i - 1].y);
+    if (accumulated + d >= interval) {
+      const t = d !== 0 ? (interval - accumulated) / d : 0;
+      const newPoint = {
+        x: pts[i - 1].x + t * (pts[i].x - pts[i - 1].x),
+        y: pts[i - 1].y + t * (pts[i].y - pts[i - 1].y),
+      };
+      newPoints.push(newPoint);
+      pts.splice(i, 0, newPoint);
+      accumulated = 0.0;
+    } else {
+      accumulated += d;
+    }
+    i += 1;
+  }
+
+  while (newPoints.length < n) newPoints.push(pts[pts.length - 1]);
+  return newPoints.slice(0, n);
+}
+
+function centroid(points) {
+  const cx = points.reduce((s, p) => s + p.x, 0) / points.length;
+  const cy = points.reduce((s, p) => s + p.y, 0) / points.length;
+  return { x: cx, y: cy };
+}
+
+function rotateToZero(points) {
+  const c = centroid(points);
+  const theta = Math.atan2(points[0].y - c.y, points[0].x - c.x);
+  return rotateBy(points, -theta, c);
+}
+
+function rotateBy(points, angle, aboutPoint = null) {
+  const c = aboutPoint || centroid(points);
+  const cosT = Math.cos(angle);
+  const sinT = Math.sin(angle);
+  return points.map((p) => ({
+    x: (p.x - c.x) * cosT - (p.y - c.y) * sinT + c.x,
+    y: (p.x - c.x) * sinT + (p.y - c.y) * cosT + c.y,
+  }));
+}
+
+function scaleToSquare(points, size = SQUARE_SIZE) {
+  const xs = points.map((p) => p.x);
+  const ys = points.map((p) => p.y);
+  const minX = Math.min(...xs), maxX = Math.max(...xs);
+  const minY = Math.min(...ys), maxY = Math.max(...ys);
+  const w = maxX - minX || 1e-9;
+  const h = maxY - minY || 1e-9;
+  return points.map((p) => ({
+    x: ((p.x - minX) * size) / w,
+    y: ((p.y - minY) * size) / h,
+  }));
+}
+
+function translateToOrigin(points) {
+  const c = centroid(points);
+  return points.map((p) => ({ x: p.x - c.x, y: p.y - c.y }));
+}
+
+function pathDistance(a, b) {
+  let total = 0;
+  for (let i = 0; i < a.length; i++) {
+    total += Math.hypot(a[i].x - b[i].x, a[i].y - b[i].y);
+  }
+  return total / a.length;
+}
+
+function bestDistance(candidate, template) {
+  let best = Infinity;
+  for (let theta = -ANGLE_SWEEP_RANGE; theta <= ANGLE_SWEEP_RANGE; theta += ANGLE_SWEEP_STEP) {
+    const rotated = rotateBy(candidate, theta);
+    const d = pathDistance(rotated, template);
+    if (d < best) best = d;
+  }
+  return best;
+}
+
+function normalize(points) {
+  const resampled = resample(points);
+  const rotated = rotateToZero(resampled);
+  const scaled = scaleToSquare(rotated);
+  return translateToOrigin(scaled);
+}
+
+
+
+function squareTemplateRaw() {
+  const pts = [];
+  for (let t = 0; t <= 25; t++) pts.push({ x: (t / 25) * SQUARE_SIZE, y: 0 });
+  for (let t = 0; t <= 25; t++) pts.push({ x: SQUARE_SIZE, y: (t / 25) * SQUARE_SIZE });
+  for (let t = 0; t <= 25; t++) pts.push({ x: SQUARE_SIZE - (t / 25) * SQUARE_SIZE, y: SQUARE_SIZE });
+  for (let t = 0; t <= 25; t++) pts.push({ x: 0, y: SQUARE_SIZE - (t / 25) * SQUARE_SIZE });
+  return pts;
+}
+
+function circleTemplateRaw() {
+  const pts = [];
+  for (let i = 0; i < 64; i++) {
+    const a = (2 * Math.PI * i) / 63;
+    pts.push({ x: (SQUARE_SIZE / 2) * Math.cos(a), y: (SQUARE_SIZE / 2) * Math.sin(a) });
+  }
+  return pts;
+}
+
+function triangleTemplateRaw() {
+  const p1 = { x: SQUARE_SIZE / 2, y: 0 };
+  const p2 = { x: 0, y: SQUARE_SIZE };
+  const p3 = { x: SQUARE_SIZE, y: SQUARE_SIZE };
+  const pts = [];
+  for (let t = 0; t <= 21; t++) {
+    const f = t / 21;
+    pts.push({ x: p1.x + f * (p2.x - p1.x), y: p1.y + f * (p2.y - p1.y) });
+  }
+  for (let t = 0; t <= 21; t++) {
+    const f = t / 21;
+    pts.push({ x: p2.x + f * (p3.x - p2.x), y: p2.y + f * (p3.y - p2.y) });
+  }
+  for (let t = 0; t <= 20; t++) {
+    const f = t / 20;
+    pts.push({ x: p3.x + f * (p1.x - p3.x), y: p3.y + f * (p1.y - p3.y) });
+  }
+  return pts;
+}
+
+function lineTemplateRaw() {
+  const pts = [];
+  for (let t = 0; t < 64; t++) pts.push({ x: (t / 63) * SQUARE_SIZE, y: 0 });
+  return pts;
+}
+
+const TEMPLATES = {
+  square: normalize(squareTemplateRaw()),
+  circle: normalize(circleTemplateRaw()),
+  triangle: normalize(triangleTemplateRaw()),
+  line: normalize(lineTemplateRaw()),
+};
+
+const DIAGONAL = Math.hypot(SQUARE_SIZE, SQUARE_SIZE);
+const HALF_DIAGONAL = DIAGONAL / 2;
+
+/**
+ * Classifies a raw stroke (array of {x, y} pixel points) against the
+ * template shapes. Returns { label, score } where score is in [0, 1]
+ * (1.0 = perfect match). Returns { label: null, score: 0 } if the
+ * stroke has too few points.
+ */
+function recognizeShape(rawPoints, minPoints = 10) {
+  if (rawPoints.length < minPoints) return { label: null, score: 0.0 };
+
+  const candidate = normalize(rawPoints);
+
+  let bestLabel = null;
+  let bestScore = -1.0;
+  for (const [label, template] of Object.entries(TEMPLATES)) {
+    const d = bestDistance(candidate, template);
+    const score = Math.max(0.0, 1.0 - d / HALF_DIAGONAL);
+    if (score > bestScore) {
+      bestLabel = label;
+      bestScore = score;
+    }
+  }
+
+  return { label: bestLabel, score: bestScore };
+}
+
+  </script>
+
+  <script>
+
+/**
+ * shape3d.js
+ *
+ * JS port of shape3d.py: minimal 3D wireframe math (rotation +
+ * perspective projection) plus three primitive builders (cube,
+ * sphere, pyramid). Pure math, no 3D library.
+ */
+
+const FOCAL_LENGTH = 340.0;
+const CAMERA_DISTANCE = 520.0;
+
+/** Combined XYZ rotation (Rz * Ry * Rx), applied to a single [x,y,z] point. */
+function rotatePoint([x, y, z], rx, ry, rz) {
+  const cx = Math.cos(rx), sx = Math.sin(rx);
+  const cy = Math.cos(ry), sy = Math.sin(ry);
+  const cz = Math.cos(rz), sz = Math.sin(rz);
+
+  let y1 = y * cx - z * sx;
+  let z1 = y * sx + z * cx;
+  let x1 = x;
+
+
+  let x2 = x1 * cy + z1 * sy;
+  let z2 = -x1 * sy + z1 * cy;
+  let y2 = y1;
+
+  // Rz
+  let x3 = x2 * cz - y2 * sz;
+  let y3 = x2 * sz + y2 * cz;
+  let z3 = z2;
+
+  return [x3, y3, z3];
+}
+
+
+function makeCube() {
+  const h = 1.0;
+  const vertices = [
+    [-h, -h, -h], [h, -h, -h], [h, h, -h], [-h, h, -h],
+    [-h, -h, h], [h, -h, h], [h, h, h], [-h, h, h],
+  ];
+  const edges = [
+    [0, 1], [1, 2], [2, 3], [3, 0],
+    [4, 5], [5, 6], [6, 7], [7, 4],
+    [0, 4], [1, 5], [2, 6], [3, 7],
+  ];
+  return { vertices, edges };
+}
+
+function makePyramid() {
+  const h = 1.0;
+  const vertices = [
+    [-h, h, -h], [h, h, -h], [h, h, h], [-h, h, h],
+    [0, -h, 0],
+  ];
+  const edges = [
+    [0, 1], [1, 2], [2, 3], [3, 0],
+    [0, 4], [1, 4], [2, 4], [3, 4],
+  ];
+  return { vertices, edges };
+}
+
+function makeSphere(stacks = 8, slices = 12) {
+  const vertices = [];
+  const indexGrid = {};
+  for (let i = 0; i <= stacks; i++) {
+    const phi = (Math.PI * i) / stacks;
+    for (let j = 0; j < slices; j++) {
+      const theta = (2 * Math.PI * j) / slices;
+      const x = Math.sin(phi) * Math.cos(theta);
+      const y = Math.cos(phi);
+      const z = Math.sin(phi) * Math.sin(theta);
+      indexGrid[`${i},${j}`] = vertices.length;
+      vertices.push([x, y, z]);
+    }
+  }
+
+  const edges = [];
+  for (let i = 0; i <= stacks; i++) {
+    for (let j = 0; j < slices; j++) {
+      edges.push([indexGrid[`${i},${j}`], indexGrid[`${i},${(j + 1) % slices}`]]);
+      if (i < stacks) {
+        edges.push([indexGrid[`${i},${j}`], indexGrid[`${i + 1},${j}`]]);
+      }
+    }
+  }
+
+  return { vertices, edges };
+}
+
+const PRIMITIVE_BUILDERS = {
+  square: makeCube,
+  circle: makeSphere,
+  triangle: makePyramid,
+};
+
+
+/**
+ * Rotates + scales object-space vertices and perspective-projects them
+ * onto screen coordinates centered at `anchor`.
+ * Returns { points2d: [{x,y}, ...], camZ: [number, ...] } -- camZ is
+ * kept for depth-based shading (smaller = closer to camera).
+ */
+function project(vertices, [rx, ry, rz], anchor, scale,
+                  focal = FOCAL_LENGTH, camDist = CAMERA_DISTANCE) {
+  const points2d = [];
+  const camZ = [];
+
+  for (const v of vertices) {
+    const [x, y, z] = rotatePoint(v, rx, ry, rz);
+    const sx = x * scale, sy = y * scale, sz = z * scale;
+    const cz = Math.max(sz + camDist, 1.0);
+    points2d.push({
+      x: anchor.x + (sx * focal) / cz,
+      y: anchor.y + (sy * focal) / cz,
+    });
+    camZ.push(cz);
+  }
+
+  return { points2d, camZ };
+}
+
+/**
+ * depthT in [0, 1], 0 = closest/brightest, 1 = farthest/dimmest.
+ * baseColor is [r, g, b]. Returns a dimmed [r, g, b].
+ */
+function shadeColor(baseColor, depthT) {
+  const factor = 1.0 - 0.65 * depthT;
+  return baseColor.map((c) => Math.round(c * factor));
+}
+
+  </script>
+
+  <script>
+  // ================================ draw.js ================================
+/**
+ * draw.js
+ *
+ * Main app: webcam loop, gesture-triggered actions, 2D/3D drawing,
+ * move-mode pan/zoom/rotate. Feature parity with the Python
+ * air_draw.py, including the $1-recognizer-based shape detection
+ * (square/circle/triangle) and the 3D wireframe mode.
+ *
+ * Requires (loaded before this file, as plain script tags):
+ *   gesture.js    -> classifyGesture, landmarkPos
+ *   recognizer.js -> recognizeShape
+ *   shape3d.js    -> PRIMITIVE_BUILDERS, project, shadeColor
+ */
+
+const FRAME_W = 1280;
+const FRAME_H = 720;
+const MIN_STROKE_POINTS_TO_KEEP = 8;
+const AUTO_ROTATE_SPEED = 0.012;
+const SHAPE3D_BASE_SCALE_DIVISOR = 2.2;
+
+
+const DRAW_COLORS = [
+  [60, 220, 255],
+  [255, 120, 60],
+  [120, 60, 255],
+  [80, 255, 120],
+  [255, 255, 255],
+];
+const rgbCss = ([r, g, b]) => `rgb(${r}, ${g}, ${b})`;
+
+const videoElement = document.getElementById("webcam");
+const canvasElement = document.getElementById("output_canvas");
+const canvasCtx = canvasElement.getContext("2d");
+const modeText = document.getElementById("mode-text");
+const colorBox = document.getElementById("color-box");
+const badge3d = document.getElementById("badge-3d");
+
+const flipCanvas = document.createElement("canvas");
+flipCanvas.width = FRAME_W;
+flipCanvas.height = FRAME_H;
+const flipCtx = flipCanvas.getContext("2d");
+
+let colorIndex = 0;
+let mode = "draw"; 
+let threeDMode = false;
+let strokes = []; 
+let undoneStrokes = [];
+let activePoints = [];
+let wasDrawing = false;
+let moveAnchor = null; 
+let moveReference = []; 
+
+
+
+class Stroke2D {
+  constructor(points, label, color) {
+    this.points = points; 
+    this.label = label; 
+    this.isClosed = label !== "freehand";
+    this.color = color;
+    this.offset = { x: 0, y: 0 };
+    this.scale = 1.0;
+  }
+
+  draw(ctx) {
+    if (this.points.length === 0) return;
+    const cx = this.points.reduce((s, p) => s + p.x, 0) / this.points.length;
+    const cy = this.points.reduce((s, p) => s + p.y, 0) / this.points.length;
+
+    ctx.beginPath();
+    ctx.strokeStyle = rgbCss(this.color);
+    ctx.lineWidth = 3;
+
+    this.points.forEach((p, i) => {
+      const tx = (p.x - cx) * this.scale + cx + this.offset.x;
+      const ty = (p.y - cy) * this.scale + cy + this.offset.y;
+      if (i === 0) ctx.moveTo(tx, ty);
+      else ctx.lineTo(tx, ty);
+    });
+
+    if (this.isClosed) ctx.closePath();
+    ctx.stroke();
+  }
+}
+
+class Shape3DObject {
+  constructor(label, anchor, size, color) {
+    this.label = label;
+    const { vertices, edges } = PRIMITIVE_BUILDERS[label]();
+    this.vertices = vertices;
+    this.edges = edges;
+    this.baseAnchor = { x: anchor.x, y: anchor.y };
+    this.baseSize = size;
+    this.color = color;
+    this.offset = { x: 0, y: 0 };
+    this.scale = 1.0;
+    this.rotation = [0.3, 0.4, 0.0]; 
+  }
+
+  stepAutoRotate() {
+    this.rotation[1] += AUTO_ROTATE_SPEED;
+  }
+
+  draw(ctx) {
+    const anchor = { x: this.baseAnchor.x + this.offset.x, y: this.baseAnchor.y + this.offset.y };
+    const { points2d, camZ } = project(
+      this.vertices, this.rotation, anchor, this.baseSize * this.scale
+    );
+    const zMin = Math.min(...camZ);
+    const zMax = Math.max(...camZ);
+    const zRange = Math.max(zMax - zMin, 1e-6);
+
+    for (const [i, j] of this.edges) {
+      const depthT = ((camZ[i] + camZ[j]) / 2 - zMin) / zRange;
+      const color = shadeColor(this.color, depthT);
+      ctx.beginPath();
+      ctx.strokeStyle = rgbCss(color);
+      ctx.lineWidth = 2;
+      ctx.moveTo(points2d[i].x, points2d[i].y);
+      ctx.lineTo(points2d[j].x, points2d[j].y);
+      ctx.stroke();
+    }
+  }
+}
+
+
+
+class GestureTrigger {
+  constructor(name, holdFrames = 5, cooldownMs = 600) {
+    this.name = name;
+    this.holdFrames = holdFrames;
+    this.cooldownMs = cooldownMs;
+    this.count = 0;
+    this.lastFired = 0;
+  }
+  update(presentGestures) {
+    if (presentGestures.has(this.name)) this.count++;
+    else this.count = 0;
+
+    const now = Date.now();
+    if (this.count === this.holdFrames && now - this.lastFired > this.cooldownMs) {
+      this.lastFired = now;
+      return true;
+    }
+    return false;
+  }
+}
+
+const triggers = {
+  modeToggle: new GestureTrigger("peace"),
+  undo: new GestureTrigger("three_up"),
+  redo: new GestureTrigger("open_palm"),
+  clear: new GestureTrigger("ok_sign"),
+  color: new GestureTrigger("thumbs_up"),
+  threeD: new GestureTrigger("rock_on"),
+};
+
+
+
+function buildCleanShape(points, label) {
+  const xs = points.map((p) => p.x);
+  const ys = points.map((p) => p.y);
+  const minX = Math.min(...xs), maxX = Math.max(...xs);
+  const minY = Math.min(...ys), maxY = Math.max(...ys);
+  const cx = (minX + maxX) / 2, cy = (minY + maxY) / 2;
+  const r = Math.max(maxX - minX, maxY - minY) / 2;
+
+  if (label === "square") {
+    return [
+      { x: cx - r, y: cy - r }, { x: cx + r, y: cy - r },
+      { x: cx + r, y: cy + r }, { x: cx - r, y: cy + r }, { x: cx - r, y: cy - r },
+    ];
+  }
+  if (label === "circle") {
+    const pts = [];
+    for (let i = 0; i <= 40; i++) {
+      const a = (i / 40) * Math.PI * 2;
+      pts.push({ x: cx + r * Math.cos(a), y: cy + r * Math.sin(a) });
+    }
+    return pts;
+  }
+  if (label === "triangle") {
+    return [
+      { x: cx, y: cy - r }, { x: cx - r, y: cy + r }, { x: cx + r, y: cy + r }, { x: cx, y: cy - r },
+    ];
+  }
+  return points;
+}
+
+function snapToShape(points) {
+  const { label, score } = recognizeShape(points);
+  if (label && score > 0.75 && label !== "line") {
+    return { cleanPoints: buildCleanShape(points, label), label };
+  }
+  return { cleanPoints: points, label: "freehand" };
+}
+
+
+
+function onResults(results) {
+  canvasCtx.save();
+  canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+
+  const presentGestures = new Set();
+  const handsInfo = [];
+
+  if (results.multiHandLandmarks) {
+    for (let i = 0; i < results.multiHandLandmarks.length; i++) {
+      const lm = results.multiHandLandmarks[i];
+      const handedness = results.multiHandedness[i].label; 
+      const gesture = classifyGesture(lm, handedness);
+      presentGestures.add(gesture);
+      const indexTip = landmarkPos(lm, canvasElement.width, canvasElement.height, INDEX_TIP);
+      handsInfo.push({ lm, handedness, gesture, indexTip });
+    }
+  }
+
+
+  if (triggers.modeToggle.update(presentGestures)) {
+    mode = mode === "draw" ? "move" : "draw";
+    moveAnchor = null;
+    activePoints = [];
+  }
+  if (triggers.undo.update(presentGestures) && strokes.length > 0) {
+    undoneStrokes.push(strokes.pop());
+  }
+  if (triggers.redo.update(presentGestures) && undoneStrokes.length > 0) {
+    strokes.push(undoneStrokes.pop());
+  }
+  if (triggers.clear.update(presentGestures)) {
+    strokes = [];
+    undoneStrokes = [];
+    activePoints = [];
+  }
+  if (triggers.color.update(presentGestures)) {
+    colorIndex = (colorIndex + 1) % DRAW_COLORS.length;
+  }
+  if (triggers.threeD.update(presentGestures)) {
+    threeDMode = !threeDMode;
+  }
+
+
+  modeText.innerText = `MODE: ${mode.toUpperCase()}`;
+  modeText.style.color = mode === "draw" ? "#38ef7d" : "#ffb43c";
+  colorBox.style.background = rgbCss(DRAW_COLORS[colorIndex]);
+  badge3d.style.display = threeDMode ? "inline" : "none";
+
+
+  if (mode === "draw") {
+    const drawHand = handsInfo.find((h) => h.gesture === "draw");
+    if (drawHand) {
+      activePoints.push(drawHand.indexTip);
+      wasDrawing = true;
+    } else {
+      if (wasDrawing && activePoints.length >= MIN_STROKE_POINTS_TO_KEEP) {
+        const { cleanPoints, label } = snapToShape(activePoints);
+        const color = DRAW_COLORS[colorIndex];
+
+        if (threeDMode && PRIMITIVE_BUILDERS[label]) {
+          const xs = activePoints.map((p) => p.x);
+          const ys = activePoints.map((p) => p.y);
+          const minX = Math.min(...xs), maxX = Math.max(...xs);
+          const minY = Math.min(...ys), maxY = Math.max(...ys);
+          const anchor = { x: (minX + maxX) / 2, y: (minY + maxY) / 2 };
+          const radius = Math.max(maxX - minX, maxY - minY) / 2;
+          const size = Math.max(radius / SHAPE3D_BASE_SCALE_DIVISOR, 20.0);
+          strokes.push(new Shape3DObject(label, anchor, size, color));
+        } else {
+          strokes.push(new Stroke2D(cleanPoints, label, color));
+        }
+        undoneStrokes = [];
+      }
+      activePoints = [];
+      wasDrawing = false;
+    }
+  } else {
+    // ---- MOVE mode ----
+    const indexTips = handsInfo.map((h) => h.indexTip);
+    if (indexTips.length === 2) {
+      const [p1, p2] = indexTips;
+      const mid = { x: (p1.x + p2.x) / 2, y: (p1.y + p2.y) / 2 };
+      const handDist = Math.hypot(p1.x - p2.x, p1.y - p2.y);
+      const handAngle = Math.atan2(p2.y - p1.y, p2.x - p1.x);
+
+      if (!moveAnchor) {
+        moveAnchor = { mid, dist: handDist, angle: handAngle };
+        moveReference = strokes.map((s) => ({
+          offset: { ...s.offset },
+          scale: s.scale,
+          rotation: s instanceof Shape3DObject ? [...s.rotation] : null,
+        }));
+      } else {
+        const pan = { x: mid.x - moveAnchor.mid.x, y: mid.y - moveAnchor.mid.y };
+        const zoom = moveAnchor.dist > 1e-6 ? handDist / moveAnchor.dist : 1.0;
+        const dAngle = handAngle - moveAnchor.angle;
+
+        strokes.forEach((s, idx) => {
+          const ref = moveReference[idx];
+          if (!ref) return;
+          s.offset.x = ref.offset.x + pan.x;
+          s.offset.y = ref.offset.y + pan.y;
+          s.scale = Math.max(0.2, Math.min(4.0, ref.scale * zoom));
+          if (s instanceof Shape3DObject && ref.rotation) {
+            s.rotation[2] = ref.rotation[2] + dAngle; 
+            s.rotation[0] = ref.rotation[0] + pan.y / 150.0; 
+          }
+        });
+      }
+    } else {
+      moveAnchor = null;
+    }
+  }
+
+  // ---- render ----
+  strokes.forEach((s) => {
+    if (s instanceof Shape3DObject) s.stepAutoRotate();
+    s.draw(canvasCtx);
+  });
+
+  if (activePoints.length > 1) {
+    canvasCtx.beginPath();
+    canvasCtx.strokeStyle = rgbCss(DRAW_COLORS[colorIndex]);
+    canvasCtx.lineWidth = 3;
+    activePoints.forEach((p, i) => {
+      if (i === 0) canvasCtx.moveTo(p.x, p.y);
+      else canvasCtx.lineTo(p.x, p.y);
+    });
+    canvasCtx.stroke();
+  }
+
+  handsInfo.forEach((h) => {
+    canvasCtx.beginPath();
+    canvasCtx.arc(h.indexTip.x, h.indexTip.y, 8, 0, 2 * Math.PI);
+    canvasCtx.fillStyle = "#ffffff";
+    canvasCtx.fill();
+  });
+
+  canvasCtx.restore();
+}
+
+
+
+const hands = new Hands({
+  locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`,
+});
+hands.setOptions({
+  maxNumHands: 2,
+  modelComplexity: 1,
+  minDetectionConfidence: 0.7,
+  minTrackingConfidence: 0.6,
+});
+hands.onResults(onResults);
+
+const camera = new Camera(videoElement, {
+  onFrame: async () => {
+
+    flipCtx.save();
+    flipCtx.scale(-1, 1);
+    flipCtx.drawImage(videoElement, -flipCanvas.width, 0, flipCanvas.width, flipCanvas.height);
+    flipCtx.restore();
+    await hands.send({ image: flipCanvas });
+  },
+  width: FRAME_W,
+  height: FRAME_H,
+});
+camera.start();
+
+  </script>
 </body>
 </html>
